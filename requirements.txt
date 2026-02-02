@@ -1,0 +1,7 @@
+playwright
+pydantic
+typer
+rich
+pandas
+pyarrow
+tenacity
