@@ -1,61 +1,73 @@
-# Architecture Decision: Hybrid Headless Browser Approach
+# System Architecture
 
-## Problem Statement
-The target site (`https://tender.nprocure.com/`) uses client-side AES encryption via JavaScript:
-- All AJAX requests are signed with cryptographic keys.
-- Keys are generated dynamically from hidden DOM elements (`salt`, `iv`).
-- Direct HTTP requests (e.g., via `curl` or `requests`) fail authentication.
+This document describes the architectural design and component interactions of the Tender Scraper POC.
 
-## Approach Comparison
+## Architectural Overview
 
-### Option A: Pure API/XHR Reverse Engineering
-**Pros:**
-- Fastest execution (no browser overhead).
-- Minimal resource usage (CPU/RAM).
+The system follows a modular architecture with a clear separation of concerns between web automation, data extraction, and persistence. It utilizes a **Hybrid Headless Scraper** approach to overcome client-side security measures.
 
-**Cons:**
-- Requires fully reverse-engineering `AesUtil.js` encryption and key exchange logic.
-- Keys or logic may rotate, breaking the scraper instantly.
-- Estimated 2-3 weeks of cryptanalysis work.
+### Core Components
 
-**Verdict:** ❌ **Too brittle, high maintenance.**
+1.  **CLI Entrypoint (`main.py`)**:
+    - Handles command-line arguments and environment variable parsing.
+    - Orchestrates the initialization of the configuration, data pipeline, and scraper.
+    - Manages the asynchronous execution loop.
 
-### Option B: Pure Headless Browser (Selenium/Playwright)
-**Pros:**
-- Handles all JS execution natively.
-- No encryption reverse-engineering required.
+2.  **Scraper Engine (`src/scraper.py`)**:
+    - **Playwright Integration**: Orchestrates a headless Chromium instance to navigate the target site and execute native JavaScript.
+    - **Network Interception**: Attaches listeners to the browser context to capture XHR/Fetch responses directly from the network layer.
+    - **Resilience**: Implements exponential backoff and retry logic for robust navigation and page interactions.
 
-**Cons:**
-- Slow (waits for full page renders, advertisements, trackers).
-- High resource usage.
-- Parsing HTML DOM is fragile and breaks with layout changes.
+3.  **Data Models (`src/models.py`)**:
+    - Defines structured schemas using **Pydantic** for both Tender records and Run Metadata.
+    - Ensures type safety, data validation, and consistent normalization across the application.
 
-**Verdict:** ⚠️ **Works but inefficient.**
+4.  **Data Pipeline (`src/pipeline.py`)**:
+    - **Persistence**: Manages writing records to disk in JSON Lines (`.jsonl`) format for crash-resiliency.
+    - **Deduplication**: Maintains an in-memory set of processed IDs to prevent duplicate entries within a run.
+    - **Metadata Tracking**: Aggregates statistics (successes, failures, durations) and saves a final audit document for every run.
 
-### Option C: Hybrid Interception (CHOSEN)
-**Implementation:**
-1.  **Launch** headless browser via Playwright.
-2.  **Navigate** to the site, allowing native JS to handle the handshake and encryption.
-3.  **Intercept** the decrypted JSON responses via the browser's network listener.
-4.  **Extract** structured data directly from the JSON (bypassing HTML parsing).
+5.  **Utilities (`src/utils.py`)**:
+    - Provides centralized logging configuration and shared helper functions.
 
-**Pros:**
-- ✅ **No encryption reverse-engineering needed.**
-- ✅ **Gets clean JSON** instead of messy HTML.
-- ✅ **Resilient** to DOM layout changes (API contracts change less often).
-- ✅ **Reasonable performance** (only initial page load is heavy).
+## Technical Design Decisions
 
-**Cons:**
-- Heavier than pure API approach (requires Chromium binary).
-- Browser dependency.
+### 1. Hybrid Interception vs. HTML Parsing
+Instead of parsing complex and potentially volatile HTML tables, the scraper intercepts the raw JSON responses sent by the server to the browser. 
+- **Benefit**: More stable, higher data fidelity, and bypasses client-side decryption complexity by capturing data after the browser has processed it.
 
-**Verdict:** ✅ **Best tradeoff for POC and production.**
+### 2. JSON Lines (NDJSON) Storage
+Data is stored in `.jsonl` format.
+- **Benefit**: Allows for incremental writes. If the process is interrupted, all records processed up to that point are preserved. It also allows for efficient reading of large datasets without loading the entire file into memory.
 
-## Production Considerations
-- **Scalability:** Run multiple browser instances in parallel (supported via `--concurrency`).
-- **Monitoring:** Network interception provides clean request/response logging.
-- **Maintenance:** If the site changes encryption, browser auto-updates handle it.
-- **Cost:** Headless browsers consume ~200MB RAM each; plan for 5-10 concurrent instances per node.
+### 3. Separation of Concerns
+The `TenderScraper` is responsible only for navigation and raw data capture. It delegates the persistence and state management to the `DataPipeline`.
+- **Benefit**: Easier to test and allows for swapping out the persistence layer (e.g., to a database) without modifying the scraper logic.
 
-## Why This Beats Alternatives
-If the site's encryption changes, our scraper keeps working because we're using the site's own code to generate signatures. A pure API approach would break and require significant re-engineering.
+### 4. Resilience and Observability
+- **Tenacity**: Used for retrying network-sensitive operations.
+- **Rich Logging**: Provides human-readable, colored logs with clear indicators of progress and errors.
+- **Run Metadata**: Every execution produces a machine-readable summary, enabling long-term monitoring of scraper health and data coverage.
+
+## Data Flow Diagram
+
+```text
+[User Command]
+      │
+      ▼
+[main.py: CLI] ───▶ [ScraperConfig]
+      │
+      ▼
+[src/scraper.py: TenderScraper] ◀───▶ [Chromium Browser]
+      │                                   │
+      │ (Interception)                    │ (Decryption/Rendering)
+      ▼                                   ▼
+[Raw Data Capture] ◀────────────────── [Network Layer]
+      │
+      ▼
+[src/models.py: Pydantic Validation]
+      │
+      ▼
+[src/pipeline.py: DataPipeline] ───▶ [data/tenders_*.jsonl]
+      │                         └───▶ [data/run_metadata.jsonl]
+```
