@@ -9,6 +9,12 @@ from src.utils import logger
 
 app = typer.Typer()
 
+@app.callback()
+def main():
+    """
+    Tender Scraper CLI
+    """
+
 @app.command()
 def scrape(
     limit: int = typer.Option(50, help="Max number of tenders to scrape"),
